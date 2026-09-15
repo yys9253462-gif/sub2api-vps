@@ -7,15 +7,27 @@
 
 set -e
 
-# --- 颜色与样式定义 ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+# --- 颜色与样式定义 (自动适配无终端环境) ---
+export TERM=${TERM:-xterm}
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    PURPLE='\033[0;35m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    PURPLE=''
+    CYAN=''
+    BOLD=''
+    NC=''
+fi
 
 # --- 全局路径变量 ---
 INSTALL_DIR="/opt/sub2api"
@@ -1096,7 +1108,7 @@ main_menu() {
     detect_os
 
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${PURPLE}======================================================================${NC}"
         echo -e "${BOLD}${CYAN}                Sub2API VPS 一键部署与运维管理平台 (v2.1)${NC}"
         echo -e "${PURPLE}======================================================================${NC}"
