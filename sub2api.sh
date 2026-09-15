@@ -722,6 +722,12 @@ register_global_cmd() {
 deploy_wizard() {
     title "Sub2API VPS 一键部署配置向导"
 
+    # 如果已有旧部署，先临时下线释放端口
+    if [ -f "$COMPOSE_FILE" ]; then
+        info "正在下线旧容器集群以释放端口..."
+        run_compose down --remove-orphans 2>/dev/null || true
+    fi
+
     # 1. 检查端口占用与部署模式选择
     local deploy_mode="caddy_ssl"
     local custom_port=18080
