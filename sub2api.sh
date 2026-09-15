@@ -1148,7 +1148,58 @@ main_menu() {
     done
 }
 
-# --- 脚本入口 (仅在直接运行而非 source 时启动主菜单) ---
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main_menu
-fi
+# --- 命令行参数分发与主菜单入口 ---
+case "$1" in
+    status)
+        check_root
+        show_status
+        ;;
+    restart)
+        check_root
+        restart_services
+        ;;
+    stop)
+        check_root
+        stop_services
+        ;;
+    start)
+        check_root
+        start_services
+        ;;
+    logs)
+        check_root
+        if [ -n "$2" ]; then
+            cd "$INSTALL_DIR" && run_compose logs -f --tail 100 "$2"
+        else
+            cd "$INSTALL_DIR" && run_compose logs -f --tail 100
+        fi
+        ;;
+    backup)
+        check_root
+        backup_data
+        ;;
+    update)
+        check_root
+        update_services
+        ;;
+    install-docker)
+        check_root
+        detect_os
+        install_dependencies
+        install_docker
+        ;;
+    help|--help|-h)
+        echo "Sub2API VPS 管理脚本使用方法:"
+        echo "  bash sub2api.sh                - 启动交互式管理控制台"
+        echo "  bash sub2api.sh status         - 查看服务与容器运行状态"
+        echo "  bash sub2api.sh restart        - 重启所有服务"
+        echo "  bash sub2api.sh stop           - 停止所有服务"
+        echo "  bash sub2api.sh start          - 启动所有服务"
+        echo "  bash sub2api.sh logs [service] - 查看实时日志 (如 sub2api, caddy, gemini-adapter)"
+        echo "  bash sub2api.sh backup         - 执行全量数据与数据库备份"
+        echo "  bash sub2api.sh update         - 在线更新镜像与服务"
+        ;;
+    *)
+        main_menu
+        ;;
+esac
