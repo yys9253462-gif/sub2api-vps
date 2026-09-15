@@ -1148,5 +1148,7 @@ main_menu() {
     done
 }
 
-# --- 脚本入口 ---
-main_menu
+# --- 脚本入口 (仅在直接运行而非 source 时启动主菜单) ---
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main_menu
+fi
