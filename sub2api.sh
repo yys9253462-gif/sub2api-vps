@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Sub2API VPS 一键部署与全生命周期运维管理脚本
+# Sub2API VPS 一键部署与全生命周期运维管理脚本 (v2.0 安全加固与生产修复版)
 # GitHub: https://github.com/yys9253462-gif/sub2api-vps
 # 适用系统: Debian 10+, Ubuntu 20.04+, CentOS 7/8/9, AlmaLinux, Rocky Linux, Alpine
-# 特性:
-#   1. Caddy 2 自动申请与续签 TLS/HTTPS 证书 (无需手动配置 Certbot)
-#   2. 内置 Gemini 工具调用 Schema 适配层 (解决 const/anyOf 400 报错)
-#   3. 内置 Thinking 标签提取与 reasoning_content 结构化转换
-#   4. 多线程并发代理与流式 SSE 低延迟传输
-#   5. 智能防火墙放行 (自动放行 ufw / firewalld 80/443 端口)
-#   6. 容器健康检查与独立内网隔离，保护数据库安全
-#   7. 注册全局 `sub2api` 命令，随时随地一键管理
-#   8. 完整的运维面板 (启停/日志/改密/换域名/备份/更新/卸载)
 # ==============================================================================
 
 set -e
@@ -24,7 +15,7 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # --- 全局路径变量 ---
 INSTALL_DIR="/opt/sub2api"
@@ -52,6 +43,14 @@ check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         error "此脚本必须以 root 用户身份运行！请使用 sudo -i 或 su root 切换后重试。"
         exit 1
+    fi
+}
+
+# --- 安全读取 .env 文件的键值 (严禁 source 防止命令注入) ---
+read_env() {
+    local key=$1
+    if [ -f "$ENV_FILE" ]; then
+        grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -n 1 | cut -d '=' -f2- | sed -e 's/^"//' -e 's/"$//'
     fi
 }
 
@@ -88,7 +87,6 @@ detect_os() {
             PKG_MANAGER="apk"
             ;;
         *)
-            warn "未明确适配的发行版: $OS，将尝试通用流程。"
             PKG_MANAGER="unknown"
             ;;
     esac
@@ -96,7 +94,7 @@ detect_os() {
 
 # --- 基础工具安装 ---
 install_dependencies() {
-    info "正在检查并安装基础依赖 (curl, wget, tar, openssl, python3, lsof)..."
+    info "正在检查并安装基础依赖 (curl, wget, tar, openssl, python3, lsof, jq)..."
     case "$PKG_MANAGER" in
         apt)
             apt update -y -q
@@ -113,7 +111,7 @@ install_dependencies() {
             apk add curl wget tar openssl ca-certificates python3 py3-pip lsof jq bash
             ;;
         *)
-            warn "无法自动安装基础包，请确保 curl, openssl, tar 已安装。"
+            warn "未识别的包管理器，请确保 curl, openssl, tar 已安装。"
             ;;
     esac
 }
@@ -121,14 +119,12 @@ install_dependencies() {
 # --- 智能放行防火墙 ---
 configure_firewall() {
     info "正在检测并配置系统防火墙，确保 80 / 443 端口通畅..."
-    # UFW (Ubuntu / Debian)
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
         ufw allow 80/tcp >/dev/null 2>&1 || true
         ufw allow 443/tcp >/dev/null 2>&1 || true
         success "已通过 UFW 放行 80 / 443 端口。"
     fi
 
-    # Firewalld (CentOS / RHEL / Alma / Rocky / Fedora)
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1 || true
         firewall-cmd --permanent --add-port=443/tcp >/dev/null 2>&1 || true
@@ -136,14 +132,13 @@ configure_firewall() {
         success "已通过 Firewalld 放行 80 / 443 端口。"
     fi
 
-    # iptables 通用兜底放行
     if command -v iptables >/dev/null 2>&1; then
         iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
     fi
 }
 
-# --- Docker 与 Docker Compose 检测及自动安装 ---
+# --- Docker 与 Docker Compose 检测及安装 ---
 install_docker() {
     if command -v docker >/dev/null 2>&1; then
         success "检测到 Docker 已安装: $(docker --version)"
@@ -161,7 +156,6 @@ install_docker() {
         success "Docker 安装成功！"
     fi
 
-    # 检查 Docker Compose
     if docker compose version >/dev/null 2>&1; then
         success "检测到 Docker Compose: $(docker compose version)"
     elif command -v docker-compose >/dev/null 2>&1; then
@@ -202,13 +196,13 @@ check_port() {
     return 0
 }
 
-# --- 随机密码生成 ---
+# --- 随机密码生成 (仅含字母数字) ---
 gen_password() {
     local len=${1:-16}
     openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c "$len"
 }
 
-# --- 生成 Gemini 适配层源码 ---
+# --- 生成 Gemini 适配层源码 (修复流式跨分块状态机 Bug) ---
 generate_adapter() {
     mkdir -p "$ADAPTER_DIR"
     cat > "$ADAPTER_DIR/adapter_service.py" << 'EOF'
@@ -216,10 +210,10 @@ generate_adapter() {
 # -*- coding: utf-8 -*-
 """
 Sub2API Gemini 工具调用与 Thinking 标签双向适配层
-功能:
+特性:
 1. 请求改写: 修复 Google Gemini 不支持 const/anyOf/oneOf/$schema 导致的 400 报错
-2. 响应改写: 提取正文中的 <thinking> 标签并规范化为 reasoning_content
-3. 并发架构: 基于 ThreadingHTTPServer 支持多路高并发与 SSE 流式无缓冲透传
+2. 响应改写: 严格流式状态机提取 <thinking> 标签，防止跨分块切断泄漏
+3. 并发架构: ThreadingHTTPServer 支持多路高并发与 SSE 流式无缓冲透传
 """
 
 import sys
@@ -238,7 +232,6 @@ SUB2API_HOST = "sub2api"
 SUB2API_PORT = 8080
 
 def clean_gemini_schema(obj):
-    """递归清理与转换 JSON Schema 兼容 Gemini 原生接口"""
     if isinstance(obj, dict):
         new_dict = {}
         for k, v in obj.items():
@@ -279,36 +272,65 @@ def process_request_body(body_bytes):
     return body_bytes
 
 class ThinkingTagFilter:
+    """严格的前缀匹配流式分块状态机"""
+    START_TAG = "<thinking>"
+    END_TAG = "</thinking>"
+
     def __init__(self):
         self.in_thinking = False
         self.buffer = ""
 
-    def process_chunk(self, content_str):
-        self.buffer += content_str
-        reasoning_parts = []
-        clean_parts = []
-        
+    def process_chunk(self, chunk):
+        self.buffer += chunk
+        clean_out = []
+        reasoning_out = []
+
         while self.buffer:
             if not self.in_thinking:
-                start_idx = self.buffer.find("<thinking>")
-                if start_idx != -1:
-                    clean_parts.append(self.buffer[:start_idx])
-                    self.buffer = self.buffer[start_idx + len("<thinking>"):]
+                idx = self.buffer.find(self.START_TAG)
+                if idx != -1:
+                    clean_out.append(self.buffer[:idx])
+                    self.buffer = self.buffer[idx + len(self.START_TAG):]
                     self.in_thinking = True
+                    continue
+                
+                # 检查 buffer 尾部是否存在 START_TAG 的可能前缀
+                matched_prefix_len = 0
+                for i in range(1, min(len(self.START_TAG), len(self.buffer) + 1)):
+                    if self.START_TAG.startswith(self.buffer[-i:]):
+                        matched_prefix_len = i
+                
+                if matched_prefix_len > 0:
+                    clean_out.append(self.buffer[:-matched_prefix_len])
+                    self.buffer = self.buffer[-matched_prefix_len:]
+                    break
                 else:
-                    clean_parts.append(self.buffer)
+                    clean_out.append(self.buffer)
                     self.buffer = ""
+                    break
             else:
-                end_idx = self.buffer.find("</thinking>")
-                if end_idx != -1:
-                    reasoning_parts.append(self.buffer[:end_idx])
-                    self.buffer = self.buffer[end_idx + len("</thinking>"):]
+                idx = self.buffer.find(self.END_TAG)
+                if idx != -1:
+                    reasoning_out.append(self.buffer[:idx])
+                    self.buffer = self.buffer[idx + len(self.END_TAG):]
                     self.in_thinking = False
+                    continue
+                
+                matched_prefix_len = 0
+                for i in range(1, min(len(self.END_TAG), len(self.buffer) + 1)):
+                    if self.END_TAG.startswith(self.buffer[-i:]):
+                        matched_prefix_len = i
+                
+                if matched_prefix_len > 0:
+                    reasoning_out.append(self.buffer[:-matched_prefix_len])
+                    self.buffer = self.buffer[-matched_prefix_len:]
+                    break
                 else:
-                    reasoning_parts.append(self.buffer)
+                    reasoning_out.append(self.buffer)
                     self.buffer = ""
+                    break
 
-        return "".join(clean_parts), "".join(reasoning_parts)
+        return "".join(clean_out), "".join(reasoning_out)
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -392,7 +414,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def run_server(port=8086):
     server = ThreadedHTTPServer(("0.0.0.0", port), ProxyHandler)
-    logging.info(f"Gemini Adapter multi-threaded server listening on port {port} -> {SUB2API_HOST}:{SUB2API_PORT}")
+    logging.info(f"Gemini Adapter listening on port {port} -> {SUB2API_HOST}:{SUB2API_PORT}")
     server.serve_forever()
 
 if __name__ == "__main__":
@@ -410,15 +432,15 @@ CMD ["python", "-u", "adapter_service.py", "8086"]
 EOF
 }
 
-# --- 生成 Docker Compose 配置文件 ---
+# --- 生成 Caddyfile 与 Docker Compose (修复 Caddy 环境变量被 bash 提前展开的致命 Bug) ---
 generate_compose() {
     local domain=$1
     local enable_adapter=$2
 
     mkdir -p "$INSTALL_DIR/caddy" "$INSTALL_DIR/data" "$INSTALL_DIR/postgres_data" "$INSTALL_DIR/redis_data"
 
-    # 生成 Caddyfile
-    cat > "$CADDY_FILE" << EOF
+    # 生成 Caddyfile: 必须使用转义 {\$DOMAIN} 防止当前 bash 提前展开成空
+    cat > "$CADDY_FILE" << 'EOF'
 {
     email {$ACME_EMAIL}
     admin off
@@ -427,19 +449,16 @@ generate_compose() {
 {$DOMAIN} {
     encode gzip zstd
 
-    # 安全响应头
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
         X-Frame-Options "DENY"
         Referrer-Policy "strict-origin-when-cross-origin"
     }
-
 EOF
 
     if [ "$enable_adapter" = "true" ]; then
-        cat >> "$CADDY_FILE" << EOF
-    # Gemini 适配层拦截特定 LLM API 路由
+        cat >> "$CADDY_FILE" << 'EOF'
     @llm_routes {
         path /v1/chat/completions*
         path /v1/responses*
@@ -452,7 +471,6 @@ EOF
         header_up X-Forwarded-Proto {scheme}
     }
 
-    # 其余 Web/后台/API 流量直连 Sub2API
     reverse_proxy sub2api:8080 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
@@ -462,7 +480,7 @@ EOF
 }
 EOF
     else
-        cat >> "$CADDY_FILE" << EOF
+        cat >> "$CADDY_FILE" << 'EOF'
     reverse_proxy sub2api:8080 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
@@ -474,7 +492,7 @@ EOF
     fi
 
     # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" << EOF
+    cat > "$COMPOSE_FILE" << 'EOF'
 services:
   caddy:
     image: caddy:2-alpine
@@ -484,8 +502,8 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      - DOMAIN=\${DOMAIN}
-      - ACME_EMAIL=\${ACME_EMAIL}
+      - DOMAIN=${DOMAIN}
+      - ACME_EMAIL=${ACME_EMAIL}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/data:/data
@@ -504,21 +522,21 @@ services:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8080
       - SERVER_MODE=release
-      - TZ=\${TZ:-Asia/Shanghai}
+      - TZ=${TZ:-Asia/Shanghai}
       - DATABASE_HOST=sub2api-db
       - DATABASE_PORT=5432
       - DATABASE_USER=sub2api
-      - DATABASE_PASSWORD=\${POSTGRES_PASSWORD}
+      - DATABASE_PASSWORD=${POSTGRES_PASSWORD}
       - DATABASE_DBNAME=sub2api
       - DATABASE_SSLMODE=disable
       - REDIS_HOST=sub2api-redis
       - REDIS_PORT=6379
       - REDIS_DB=0
-      - ADMIN_EMAIL=\${ADMIN_EMAIL}
-      - ADMIN_PASSWORD=\${ADMIN_PASSWORD}
-      - JWT_SECRET=\${JWT_SECRET}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
       - JWT_EXPIRE_HOUR=24
-      - TOTP_ENCRYPTION_KEY=\${TOTP_ENCRYPTION_KEY}
+      - TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY}
       - SECURITY_URL_ALLOWLIST_ENABLED=true
       - ANTIGRAVITY_USER_AGENT_VERSION=4.3.0
     volumes:
@@ -537,9 +555,9 @@ services:
     restart: unless-stopped
     environment:
       - POSTGRES_USER=sub2api
-      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=sub2api
-      - TZ=\${TZ:-Asia/Shanghai}
+      - TZ=${TZ:-Asia/Shanghai}
     volumes:
       - ./postgres_data:/var/lib/postgresql/data
     networks:
@@ -568,7 +586,7 @@ EOF
 
     if [ "$enable_adapter" = "true" ]; then
         generate_adapter
-        cat >> "$COMPOSE_FILE" << EOF
+        cat >> "$COMPOSE_FILE" << 'EOF'
 
   gemini-adapter:
     build:
@@ -582,7 +600,7 @@ EOF
 EOF
     fi
 
-    cat >> "$COMPOSE_FILE" << EOF
+    cat >> "$COMPOSE_FILE" << 'EOF'
 
 networks:
   sub2api-net:
@@ -590,7 +608,7 @@ networks:
 EOF
 }
 
-# --- 注册全局快捷管理命令 (修复 curl|bash 下 $0 不是实体脚本的严重 Bug) ---
+# --- 注册全局快捷管理命令 (兼容管道执行) ---
 register_global_cmd() {
     info "正在配置全局快捷管理命令 'sub2api'..."
     mkdir -p "$INSTALL_DIR"
@@ -620,13 +638,16 @@ deploy_wizard() {
     fi
     success "80 / 443 端口空闲，可供 Caddy 申请 HTTPS。"
 
-    # 2. 交互收集域名
+    # 2. 交互收集与正则校验域名
     echo ""
     echo -e "${YELLOW}提示: 请确保域名已在 DNS 处添加 A 记录解析到本 VPS IP (若用 Cloudflare 请设置为 DNS Only / 灰色小云朵)。${NC}"
-    read -p "请输入您绑定的完整域名 (例如: api.example.com): " DOMAIN_INPUT
-    while [ -z "$DOMAIN_INPUT" ]; do
-        error "域名不能为空，请重新输入！"
+    while true; do
         read -p "请输入您绑定的完整域名 (例如: api.example.com): " DOMAIN_INPUT
+        if [[ "$DOMAIN_INPUT" =~ ^[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]$ ]]; then
+            break
+        else
+            error "域名格式不合法，请重新输入！"
+        fi
     done
 
     # 3. 收集 ACME 邮箱
@@ -673,7 +694,7 @@ deploy_wizard() {
         exit 0
     fi
 
-    # 开始执行安装流程
+    # 执行安装流程
     install_dependencies
     configure_firewall
     install_docker
@@ -682,26 +703,26 @@ deploy_wizard() {
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    # 生成密码与密钥
+    # 生成安全的随机密码与密钥
     PG_PASS=$(gen_password 24)
     JWT_SEC=$(gen_password 32)
     TOTP_KEY=$(gen_password 32)
 
-    # 写入 .env 文件
+    # 安全写入 .env 文件 (所有值加双引号)
     cat > "$ENV_FILE" << EOF
-DOMAIN=${DOMAIN_INPUT}
-ACME_EMAIL=${EMAIL_INPUT}
-ADMIN_EMAIL=${ADMIN_EMAIL_INPUT}
-ADMIN_PASSWORD=${ADMIN_PASS_INPUT}
-POSTGRES_PASSWORD=${PG_PASS}
-JWT_SECRET=${JWT_SEC}
-TOTP_ENCRYPTION_KEY=${TOTP_KEY}
-TZ=Asia/Shanghai
-ENABLE_ADAPTER=${ENABLE_ADAPTER}
+DOMAIN="${DOMAIN_INPUT}"
+ACME_EMAIL="${EMAIL_INPUT}"
+ADMIN_EMAIL="${ADMIN_EMAIL_INPUT}"
+ADMIN_PASSWORD="${ADMIN_PASS_INPUT}"
+POSTGRES_PASSWORD="${PG_PASS}"
+JWT_SECRET="${JWT_SEC}"
+TOTP_ENCRYPTION_KEY="${TOTP_KEY}"
+TZ="Asia/Shanghai"
+ENABLE_ADAPTER="${ENABLE_ADAPTER}"
 EOF
     chmod 600 "$ENV_FILE"
 
-    # 生成编排与 Caddy 配置
+    # 生成 Compose 与 Caddyfile
     generate_compose "$DOMAIN_INPUT" "$ENABLE_ADAPTER"
 
     info "正在拉取 Docker 镜像并启动容器集群..."
@@ -711,15 +732,18 @@ EOF
     # 注册全局管理命令
     register_global_cmd
 
-    # 等待服务就绪
-    info "正在等待 Sub2API 服务初始化完成..."
+    # 精确健康检查 (解决 sub2api 容易被模糊命中的 Bug)
+    info "正在等待 Sub2API 服务与数据库就绪..."
     local retry=0
     local max_retries=30
     local is_ready=0
 
     while [ $retry -lt $max_retries ]; do
         sleep 3
-        if docker ps | grep -q "sub2api" && docker ps | grep -q "sub2api-caddy"; then
+        local sub2api_status=$(docker inspect --format '{{.State.Status}}' sub2api 2>/dev/null || echo "not_found")
+        local caddy_status=$(docker inspect --format '{{.State.Status}}' sub2api-caddy 2>/dev/null || echo "not_found")
+        
+        if [ "$sub2api_status" = "running" ] && [ "$caddy_status" = "running" ]; then
             is_ready=1
             break
         fi
@@ -739,7 +763,7 @@ EOF
         echo -e "配置文件目录   : ${CYAN}${INSTALL_DIR}${NC}"
         echo -e "${PURPLE}======================================================================${NC}"
     else
-        error "部署可能超时或异常，请在终端输入 'sub2api' 选择 [3] 查看容器日志。"
+        error "部署超时或异常退出！请在终端输入 'sub2api' 选择 [3] 查看容器日志排查。"
     fi
 }
 
@@ -753,10 +777,11 @@ show_status() {
     cd "$INSTALL_DIR"
     run_compose ps
     echo ""
-    if [ -f "$ENV_FILE" ]; then
-        . "$ENV_FILE"
-        echo -e "当前域名   : ${GREEN}https://${DOMAIN}${NC}"
-        echo -e "管理员账号 : ${CYAN}${ADMIN_EMAIL}${NC}"
+    local cur_domain=$(read_env "DOMAIN")
+    local cur_email=$(read_env "ADMIN_EMAIL")
+    if [ -n "$cur_domain" ]; then
+        echo -e "当前域名   : ${GREEN}https://${cur_domain}${NC}"
+        echo -e "管理员账号 : ${CYAN}${cur_email}${NC}"
     fi
 }
 
@@ -822,19 +847,23 @@ change_domain() {
         error "未找到配置文件！"
         return
     fi
-    . "$ENV_FILE"
-    echo -e "当前配置的域名为: ${YELLOW}${DOMAIN}${NC}"
-    read -p "请输入全新的域名 (例如: api.newdomain.com): " NEW_DOMAIN
-    if [ -z "$NEW_DOMAIN" ]; then
-        error "域名不能为空！"
-        return
-    fi
+    local cur_domain=$(read_env "DOMAIN")
+    local cur_adapter=$(read_env "ENABLE_ADAPTER")
+    echo -e "当前配置的域名为: ${YELLOW}${cur_domain}${NC}"
+    while true; do
+        read -p "请输入全新的域名 (例如: api.newdomain.com): " NEW_DOMAIN
+        if [[ "$NEW_DOMAIN" =~ ^[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]$ ]]; then
+            break
+        else
+            error "域名格式不合法，请重新输入！"
+        fi
+    done
 
-    # 更新 .env
-    sed -i "s/^DOMAIN=.*/DOMAIN=${NEW_DOMAIN}/g" "$ENV_FILE"
+    # 安全替换 .env
+    sed -i "s/^DOMAIN=.*/DOMAIN=\"${NEW_DOMAIN}\"/g" "$ENV_FILE"
     
-    # 重新生成配置
-    generate_compose "$NEW_DOMAIN" "${ENABLE_ADAPTER:-true}"
+    # 重新生成配置并全量刷新容器环境变量
+    generate_compose "$NEW_DOMAIN" "${cur_adapter:-true}"
 
     info "正在重新加载容器并让 Caddy 申请新域名证书..."
     run_compose up -d --remove-orphans
@@ -842,25 +871,28 @@ change_domain() {
 }
 
 reset_admin_password() {
-    title "重置 Sub2API 管理员密码"
+    title "Sub2API 管理员密码管理"
     cd "$INSTALL_DIR"
     if [ ! -f "$ENV_FILE" ]; then
         error "未找到配置文件！"
         return
     fi
-    . "$ENV_FILE"
-    DEFAULT_P=$(gen_password 16)
-    read -p "请输入新密码 [回车使用随机密码: ${DEFAULT_P}]: " NEW_P
-    NEW_P=${NEW_P:-$DEFAULT_P}
-
-    sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=${NEW_P}/g" "$ENV_FILE"
-    
-    info "正在重启 Sub2API 容器以应用新管理员密码..."
-    run_compose up -d --force-recreate sub2api
+    local cur_email=$(read_env "ADMIN_EMAIL")
+    echo -e "当前管理员账号: ${CYAN}${cur_email}${NC}"
     echo ""
-    success "管理员密码重置完成！"
-    echo -e "登录账号: ${CYAN}${ADMIN_EMAIL}${NC}"
-    echo -e "新密码   : ${YELLOW}${NEW_P}${NC}"
+    echo -e "${YELLOW}注意: Sub2API 的密码由数据库安全加密存储。${NC}"
+    echo -e "  方法 1 (推荐): 请直接登录 Web 管理后台 -> 右上角个人中心直接修改密码。"
+    echo -e "  方法 2: 若彻底忘记密码且无法登录，可通过本工具重置 .env 初始化密码并按需重建。"
+    echo ""
+    read -p "是否更新 .env 中的预设管理员密码？[y/N]: " UPDATE_ENV_PASS
+    if [[ "$UPDATE_ENV_PASS" =~ ^[yY] ]]; then
+        DEFAULT_P=$(gen_password 16)
+        read -p "请输入新密码 [回车使用随机密码: ${DEFAULT_P}]: " NEW_P
+        NEW_P=${NEW_P:-$DEFAULT_P}
+        sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=\"${NEW_P}\"/g" "$ENV_FILE"
+        success "已更新 .env 中的预设管理员密码为: ${YELLOW}${NEW_P}${NC}"
+        info "请在 Web 后台使用该密码登录；如遇老库不生效，请进入后台个人资料中同步修改。"
+    fi
 }
 
 backup_data() {
@@ -870,7 +902,10 @@ backup_data() {
     TAR_FILE="${BACKUP_DIR}/sub2api_backup_${TIMESTAMP}.tar.gz"
     SQL_DUMP="${INSTALL_DIR}/sub2api_dump_${TIMESTAMP}.sql"
 
-    info "正在检查数据库容器状态并导出数据..."
+    info "正在触发 Redis 数据落盘 (SAVE)..."
+    docker exec sub2api-redis redis-cli save 2>/dev/null || true
+
+    info "正在导出 PostgreSQL 数据库 SQL 归档..."
     if ! docker exec sub2api-db pg_dump -U sub2api sub2api > "$SQL_DUMP" 2>/dev/null || [ ! -s "$SQL_DUMP" ]; then
         warn "PostgreSQL 实时导出失败或为空，将直接打包磁盘持久卷数据。"
         rm -f "$SQL_DUMP"
@@ -889,7 +924,8 @@ backup_data() {
 
     rm -f "$SQL_DUMP"
     if [ -f "$TAR_FILE" ] && [ -s "$TAR_FILE" ]; then
-        success "备份文件已生成: ${GREEN}${TAR_FILE}${NC}"
+        chmod 600 "$TAR_FILE"
+        success "全量备份文件已生成 (已设 600 安全权限): ${GREEN}${TAR_FILE}${NC}"
         echo -e "文件大小: $(du -h "$TAR_FILE" | awk '{print $1}')"
     else
         error "备份生成失败，请检查磁盘剩余空间！"
@@ -924,14 +960,18 @@ main_menu() {
     while true; do
         clear
         echo -e "${PURPLE}======================================================================${NC}"
-        echo -e "${BOLD}${CYAN}                Sub2API VPS 一键部署与运维管理平台${NC}"
+        echo -e "${BOLD}${CYAN}                Sub2API VPS 一键部署与运维管理平台 (v2.0)${NC}"
         echo -e "${PURPLE}======================================================================${NC}"
-        if [ -f "$ENV_FILE" ]; then
-            . "$ENV_FILE"
-            echo -e " 运行状态 : $(docker ps 2>/dev/null | grep -q 'sub2api' && echo -e "${GREEN}● 运行中${NC}" || echo -e "${RED}○ 已停止${NC}")"
-            echo -e " 绑定域名 : ${CYAN}https://${DOMAIN}${NC}"
-            echo -e " 管理账号 : ${CYAN}${ADMIN_EMAIL}${NC}"
-            echo -e " 适配层   : $([ "$ENABLE_ADAPTER" = "true" ] && echo -e "${GREEN}已开启 (Gemini 400/Thinking 优化)${NC}" || echo -e "${YELLOW}未启用${NC}")"
+        local cur_domain=$(read_env "DOMAIN")
+        local cur_email=$(read_env "ADMIN_EMAIL")
+        local cur_adapter=$(read_env "ENABLE_ADAPTER")
+
+        if [ -n "$cur_domain" ]; then
+            local is_running=$(docker inspect --format '{{.State.Status}}' sub2api 2>/dev/null || echo "stopped")
+            echo -e " 运行状态 : $([ "$is_running" = "running" ] && echo -e "${GREEN}● 运行中${NC}" || echo -e "${RED}○ 已停止${NC}")"
+            echo -e " 绑定域名 : ${CYAN}https://${cur_domain}${NC}"
+            echo -e " 管理账号 : ${CYAN}${cur_email}${NC}"
+            echo -e " 适配层   : $([ "$cur_adapter" = "true" ] && echo -e "${GREEN}已开启 (Gemini 400/Thinking 优化)${NC}" || echo -e "${YELLOW}未启用${NC}")"
         else
             echo -e " 运行状态 : ${YELLOW}未安装${NC}"
         fi
@@ -944,7 +984,7 @@ main_menu() {
         echo -e "  ${BOLD}6.${NC} 启动全部服务"
         echo -e "  ${BOLD}7.${NC} 在线一键升级 Sub2API 与所有容器镜像"
         echo -e "  ${BOLD}8.${NC} 更换绑定域名 (自动重签 HTTPS 证书)"
-        echo -e "  ${BOLD}9.${NC} 重置/修改管理员密码"
+        echo -e "  ${BOLD}9.${NC} 管理员密码说明与预设修改"
         echo -e " ${BOLD}10.${NC} 一键全量数据备份 (PostgreSQL + Redis + 配置)"
         echo -e " ${BOLD}11.${NC} ${RED}彻底卸载并清理所有数据${NC}"
         echo -e "  ${BOLD}0.${NC} 退出脚本"
