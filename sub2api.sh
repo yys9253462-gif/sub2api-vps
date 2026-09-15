@@ -795,9 +795,20 @@ deploy_wizard() {
         EMAIL_INPUT="admin@sub2api.local"
     fi
 
-    # 3. 收集管理员邮箱
-    read -p "请输入 Sub2API 初始管理员账号邮箱 [默认: admin@${domain_input}]: " ADMIN_EMAIL_INPUT
-    ADMIN_EMAIL_INPUT=${ADMIN_EMAIL_INPUT:-"admin@${domain_input}"}
+    # 3. 收集并严格校验管理员邮箱 (Gin 框架强制要求合规 RFC 邮箱格式)
+    local default_admin_email="admin@sub2api.local"
+    if [ "$deploy_mode" = "caddy_ssl" ]; then
+        default_admin_email="admin@${domain_input}"
+    fi
+    while true; do
+        read -p "请输入 Sub2API 初始管理员账号邮箱 [默认: ${default_admin_email}]: " ADMIN_EMAIL_INPUT
+        ADMIN_EMAIL_INPUT=${ADMIN_EMAIL_INPUT:-$default_admin_email}
+        if [[ "$ADMIN_EMAIL_INPUT" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            break
+        else
+            error "邮箱格式不合法（必须带顶级域名如 .com / .local），请重新输入！"
+        fi
+    done
 
     # 4. 收集/生成管理员密码
     DEFAULT_PASS=$(gen_password 16)
