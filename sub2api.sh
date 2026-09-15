@@ -206,10 +206,15 @@ check_port() {
     return 0
 }
 
-# --- 随机密码生成 (仅含字母数字) ---
+# --- 随机密码与 HEX 密钥生成 ---
 gen_password() {
     local len=${1:-16}
     openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c "$len"
+}
+
+gen_hex_key() {
+    local bytes=${1:-32}
+    openssl rand -hex "$bytes"
 }
 
 # --- 生成 Gemini 适配层源码 (含非流式与流式全场景 Thinking 提取与编码保护) ---
@@ -369,6 +374,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.handle_proxy()
 
     def do_GET(self):
+        self.handle_proxy()
+
+    def do_HEAD(self):
         self.handle_proxy()
 
     def do_OPTIONS(self):
@@ -835,10 +843,10 @@ deploy_wizard() {
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    # 生成安全的随机密码与密钥
+    # 生成安全的随机密码与 Hex 密钥 (TOTP 必须为 64 位 Hex 字符)
     PG_PASS=$(gen_password 24)
-    JWT_SEC=$(gen_password 32)
-    TOTP_KEY=$(gen_password 32)
+    JWT_SEC=$(gen_hex_key 32)
+    TOTP_KEY=$(gen_hex_key 32)
 
     # 安全写入 .env 文件
     cat > "$ENV_FILE" << EOF
