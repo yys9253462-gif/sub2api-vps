@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Sub2API VPS 一键部署与全生命周期运维管理脚本 (v2.0 安全加固与生产修复版)
+# Sub2API VPS 一键部署与全生命周期运维管理脚本 (v2.1 深度加固与生产修复版)
 # GitHub: https://github.com/yys9253462-gif/sub2api-vps
 # 适用系统: Debian 10+, Ubuntu 20.04+, CentOS 7/8/9, AlmaLinux, Rocky Linux, Alpine
 # ==============================================================================
@@ -202,7 +202,7 @@ gen_password() {
     openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c "$len"
 }
 
-# --- 生成 Gemini 适配层源码 (修复流式跨分块状态机 Bug) ---
+# --- 生成 Gemini 适配层源码 (含非流式与流式全场景 Thinking 提取与编码保护) ---
 generate_adapter() {
     mkdir -p "$ADAPTER_DIR"
     cat > "$ADAPTER_DIR/adapter_service.py" << 'EOF'
@@ -212,8 +212,8 @@ generate_adapter() {
 Sub2API Gemini 工具调用与 Thinking 标签双向适配层
 特性:
 1. 请求改写: 修复 Google Gemini 不支持 const/anyOf/oneOf/$schema 导致的 400 报错
-2. 响应改写: 严格流式状态机提取 <thinking> 标签，防止跨分块切断泄漏
-3. 并发架构: ThreadingHTTPServer 支持多路高并发与 SSE 流式无缓冲透传
+2. 响应改写: 流式与非流式全场景精准提取 <thinking> 标签，防止泄露
+3. 传输加固: 剥离 Accept-Encoding 避免 gzip 乱码，支持 ThreadingHTTPServer 高并发
 """
 
 import sys
@@ -271,6 +271,24 @@ def process_request_body(body_bytes):
         pass
     return body_bytes
 
+def extract_thinking_from_text(text):
+    """从完整文本中提取 <thinking> 标签并拆分为正文与思考内容"""
+    if not text or "<thinking>" not in text:
+        return text, ""
+    
+    reasoning_parts = []
+    clean_parts = []
+    pos = 0
+    pattern = re.compile(r'<thinking>(.*?)</thinking>', re.DOTALL)
+    
+    for match in pattern.finditer(text):
+        clean_parts.append(text[pos:match.start()])
+        reasoning_parts.append(match.group(1))
+        pos = match.end()
+    clean_parts.append(text[pos:])
+    
+    return "".join(clean_parts), "\n".join(reasoning_parts)
+
 class ThinkingTagFilter:
     """严格的前缀匹配流式分块状态机"""
     START_TAG = "<thinking>"
@@ -294,7 +312,6 @@ class ThinkingTagFilter:
                     self.in_thinking = True
                     continue
                 
-                # 检查 buffer 尾部是否存在 START_TAG 的可能前缀
                 matched_prefix_len = 0
                 for i in range(1, min(len(self.START_TAG), len(self.buffer) + 1)):
                     if self.START_TAG.startswith(self.buffer[-i:]):
@@ -357,8 +374,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         target_url = f"http://{SUB2API_HOST}:{SUB2API_PORT}{self.path}"
         req = Request(target_url, data=body if self.command == "POST" else None, method=self.command)
         
+        # 转发 Headers (剥离 accept-encoding 防止 gzip 二进制流打乱行解析)
         for k, v in self.headers.items():
-            if k.lower() not in ("host", "content-length", "connection"):
+            if k.lower() not in ("host", "content-length", "connection", "accept-encoding"):
                 req.add_header(k, v)
         if body:
             req.add_header("Content-Length", str(len(body)))
@@ -368,13 +386,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             with urlopen(req, timeout=300) as response:
                 self.send_response(response.status)
                 for k, v in response.headers.items():
-                    if k.lower() not in ("transfer-encoding", "content-length", "connection"):
+                    if k.lower() not in ("transfer-encoding", "content-length", "connection", "content-encoding"):
                         self.send_header(k, v)
                 
                 is_sse = "text/event-stream" in response.headers.get("Content-Type", "")
                 
                 if not is_sse:
                     resp_body = response.read()
+                    # 尝试清洗非流式响应中的 Thinking 标签
+                    try:
+                        resp_json = json.loads(resp_body.decode('utf-8'))
+                        choices = resp_json.get("choices", [])
+                        if choices and "message" in choices[0]:
+                            msg = choices[0]["message"]
+                            raw_content = msg.get("content", "")
+                            if raw_content and "<thinking>" in raw_content:
+                                clean_t, reason_t = extract_thinking_from_text(raw_content)
+                                msg["content"] = clean_t
+                                if reason_t:
+                                    msg["reasoning_content"] = reason_t
+                                resp_body = json.dumps(resp_json, ensure_ascii=False).encode('utf-8')
+                    except Exception:
+                        pass
+                    
                     self.send_header("Content-Length", str(len(resp_body)))
                     self.end_headers()
                     self.wfile.write(resp_body)
@@ -432,14 +466,16 @@ CMD ["python", "-u", "adapter_service.py", "8086"]
 EOF
 }
 
-# --- 生成 Caddyfile 与 Docker Compose (修复 Caddy 环境变量被 bash 提前展开的致命 Bug) ---
+# --- 生成 Caddyfile 与 Docker Compose ---
 generate_compose() {
     local domain=$1
     local enable_adapter=$2
 
-    mkdir -p "$INSTALL_DIR/caddy" "$INSTALL_DIR/data" "$INSTALL_DIR/postgres_data" "$INSTALL_DIR/redis_data"
+    mkdir -p "$INSTALL_DIR/caddy" "$INSTALL_DIR/caddy/data" "$INSTALL_DIR/caddy/config" \
+             "$INSTALL_DIR/data" "$INSTALL_DIR/postgres_data" "$INSTALL_DIR/redis_data"
+    chmod 755 "$INSTALL_DIR/caddy/data" "$INSTALL_DIR/caddy/config" 2>/dev/null || true
 
-    # 生成 Caddyfile: 必须使用转义 {\$DOMAIN} 防止当前 bash 提前展开成空
+    # 生成 Caddyfile: 单引号 Heredoc 保持 {$DOMAIN} 原样
     cat > "$CADDY_FILE" << 'EOF'
 {
     email {$ACME_EMAIL}
@@ -685,7 +721,7 @@ deploy_wizard() {
     echo -e "证书通知邮箱   : ${CYAN}${EMAIL_INPUT}${NC}"
     echo -e "管理员账号     : ${CYAN}${ADMIN_EMAIL_INPUT}${NC}"
     echo -e "管理员密码     : ${YELLOW}${ADMIN_PASS_INPUT}${NC}"
-    echo -e "Gemini 适配层  : $([ "$ENABLE_ADAPTER" = "true" ] && echo -e "${GREEN}已启用 (并发增强版)${NC}" || echo -e "${RED}已关闭${NC}")"
+    echo -e "Gemini 适配层  : $([ "$ENABLE_ADAPTER" = "true" ] && echo -e "${GREEN}已启用 (全场景 Thinking 适配版)${NC}" || echo -e "${RED}已关闭${NC}")"
     echo -e "安装目录       : ${CYAN}${INSTALL_DIR}${NC}"
     echo ""
     read -p "确认以上配置无误并开始部署？[Y/n]: " CONFIRM_DEPLOY
@@ -708,7 +744,7 @@ deploy_wizard() {
     JWT_SEC=$(gen_password 32)
     TOTP_KEY=$(gen_password 32)
 
-    # 安全写入 .env 文件 (所有值加双引号)
+    # 安全写入 .env 文件
     cat > "$ENV_FILE" << EOF
 DOMAIN="${DOMAIN_INPUT}"
 ACME_EMAIL="${EMAIL_INPUT}"
@@ -732,7 +768,7 @@ EOF
     # 注册全局管理命令
     register_global_cmd
 
-    # 精确健康检查 (解决 sub2api 容易被模糊命中的 Bug)
+    # 精确健康检查
     info "正在等待 Sub2API 服务与数据库就绪..."
     local retry=0
     local max_retries=30
@@ -859,10 +895,7 @@ change_domain() {
         fi
     done
 
-    # 安全替换 .env
     sed -i "s/^DOMAIN=.*/DOMAIN=\"${NEW_DOMAIN}\"/g" "$ENV_FILE"
-    
-    # 重新生成配置并全量刷新容器环境变量
     generate_compose "$NEW_DOMAIN" "${cur_adapter:-true}"
 
     info "正在重新加载容器并让 Caddy 申请新域名证书..."
@@ -960,7 +993,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${PURPLE}======================================================================${NC}"
-        echo -e "${BOLD}${CYAN}                Sub2API VPS 一键部署与运维管理平台 (v2.0)${NC}"
+        echo -e "${BOLD}${CYAN}                Sub2API VPS 一键部署与运维管理平台 (v2.1)${NC}"
         echo -e "${PURPLE}======================================================================${NC}"
         local cur_domain=$(read_env "DOMAIN")
         local cur_email=$(read_env "ADMIN_EMAIL")
