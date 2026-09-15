@@ -118,23 +118,21 @@ install_dependencies() {
 
 # --- 智能放行防火墙 ---
 configure_firewall() {
-    info "正在检测并配置系统防火墙，确保 80 / 443 端口通畅..."
+    local port=${1:-80}
+    info "正在检测并配置系统防火墙，确保端口 ${port} 通畅..."
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-        ufw allow 80/tcp >/dev/null 2>&1 || true
-        ufw allow 443/tcp >/dev/null 2>&1 || true
-        success "已通过 UFW 放行 80 / 443 端口。"
+        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+        success "已通过 UFW 放行 ${port}/tcp 端口。"
     fi
 
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port=443/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
-        success "已通过 Firewalld 放行 80 / 443 端口。"
+        success "已通过 Firewalld 放行 ${port}/tcp 端口。"
     fi
 
     if command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-        iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || true
     fi
 }
 
@@ -466,17 +464,20 @@ CMD ["python", "-u", "adapter_service.py", "8086"]
 EOF
 }
 
-# --- 生成 Caddyfile 与 Docker Compose ---
+# --- 生成 Docker Compose 配置文件 (支持 Caddy 自动 HTTPS 或 独立端口映射模式) ---
 generate_compose() {
     local domain=$1
     local enable_adapter=$2
+    local deploy_mode=${3:-"caddy_ssl"}
+    local custom_port=${4:-18080}
 
     mkdir -p "$INSTALL_DIR/caddy" "$INSTALL_DIR/caddy/data" "$INSTALL_DIR/caddy/config" \
              "$INSTALL_DIR/data" "$INSTALL_DIR/postgres_data" "$INSTALL_DIR/redis_data"
     chmod 755 "$INSTALL_DIR/caddy/data" "$INSTALL_DIR/caddy/config" 2>/dev/null || true
 
-    # 生成 Caddyfile: 单引号 Heredoc 保持 {$DOMAIN} 原样
-    cat > "$CADDY_FILE" << 'EOF'
+    if [ "$deploy_mode" = "caddy_ssl" ]; then
+        # 生成 Caddyfile
+        cat > "$CADDY_FILE" << 'EOF'
 {
     email {$ACME_EMAIL}
     admin off
@@ -492,9 +493,8 @@ generate_compose() {
         Referrer-Policy "strict-origin-when-cross-origin"
     }
 EOF
-
-    if [ "$enable_adapter" = "true" ]; then
-        cat >> "$CADDY_FILE" << 'EOF'
+        if [ "$enable_adapter" = "true" ]; then
+            cat >> "$CADDY_FILE" << 'EOF'
     @llm_routes {
         path /v1/chat/completions*
         path /v1/responses*
@@ -515,8 +515,8 @@ EOF
     }
 }
 EOF
-    else
-        cat >> "$CADDY_FILE" << 'EOF'
+        else
+            cat >> "$CADDY_FILE" << 'EOF'
     reverse_proxy sub2api:8080 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
@@ -525,10 +525,10 @@ EOF
     }
 }
 EOF
-    fi
+        fi
 
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" << 'EOF'
+        # 生成 带 Caddy 的 compose
+        cat > "$COMPOSE_FILE" << 'EOF'
 services:
   caddy:
     image: caddy:2-alpine
@@ -548,11 +548,34 @@ services:
       - sub2api-net
     depends_on:
       - sub2api
+EOF
+    else
+        # 独立端口映射模式 (无需 Caddy，直接映射宿主机端口)
+        cat > "$COMPOSE_FILE" << 'EOF'
+services:
+EOF
+    fi
 
+    # Sub2API 核心服务定义
+    if [ "$deploy_mode" = "custom_port" ] && [ "$enable_adapter" != "true" ]; then
+        cat >> "$COMPOSE_FILE" << EOF
   sub2api:
     image: weishaw/sub2api:latest
     container_name: sub2api
     restart: unless-stopped
+    ports:
+      - "${custom_port}:8080"
+EOF
+    else
+        cat >> "$COMPOSE_FILE" << 'EOF'
+  sub2api:
+    image: weishaw/sub2api:latest
+    container_name: sub2api
+    restart: unless-stopped
+EOF
+    fi
+
+    cat >> "$COMPOSE_FILE" << 'EOF'
     environment:
       - AUTO_SETUP=true
       - SERVER_HOST=0.0.0.0
@@ -622,7 +645,23 @@ EOF
 
     if [ "$enable_adapter" = "true" ]; then
         generate_adapter
-        cat >> "$COMPOSE_FILE" << 'EOF'
+        if [ "$deploy_mode" = "custom_port" ]; then
+            cat >> "$COMPOSE_FILE" << EOF
+
+  gemini-adapter:
+    build:
+      context: ./adapter
+    container_name: sub2api-gemini-adapter
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:8086"
+    networks:
+      - sub2api-net
+    depends_on:
+      - sub2api
+EOF
+        else
+            cat >> "$COMPOSE_FILE" << 'EOF'
 
   gemini-adapter:
     build:
@@ -634,6 +673,7 @@ EOF
     depends_on:
       - sub2api
 EOF
+        fi
     fi
 
     cat >> "$COMPOSE_FILE" << 'EOF'
@@ -662,44 +702,83 @@ register_global_cmd() {
 deploy_wizard() {
     title "Sub2API VPS 一键部署配置向导"
 
-    # 1. 检查端口占用
-    info "正在检查 80 / 443 端口是否被占用..."
-    if ! check_port 80; then
-        error "端口 80 已被其他服务占用！请先停止占用 80 端口的 Web 服务（如 Apache / Nginx）后再试。"
-        exit 1
-    fi
-    if ! check_port 443; then
-        error "端口 443 已被其他服务占用！请先释放 443 端口后重试。"
-        exit 1
-    fi
-    success "80 / 443 端口空闲，可供 Caddy 申请 HTTPS。"
+    # 1. 检查端口占用与部署模式选择
+    local deploy_mode="caddy_ssl"
+    local custom_port=18080
+    local domain_input=""
 
-    # 2. 交互收集与正则校验域名
+    info "正在检查 80 / 443 端口占用状态..."
+    local port80_busy=0
+    local port443_busy=0
+    if ! check_port 80; then port80_busy=1; fi
+    if ! check_port 443; then port443_busy=1; fi
+
+    if [ $port80_busy -eq 1 ] || [ $port443_busy -eq 1 ]; then
+        warn "检测到端口 80 或 443 已被系统现有服务 (如 Nginx/Apache/Xray) 占用！"
+        echo -e "  [1] ${GREEN}使用独立端口共存模式 (推荐，不影响现有 Nginx 站点)${NC}"
+        echo -e "  [2] 终止现有服务并由 Caddy 独占 80/443"
+        echo -e "  [0] 退出部署"
+        read -p "请选择应对方案 [1-2, 默认: 1]: " PORT_CONFLICT_CHOICE
+        PORT_CONFLICT_CHOICE=${PORT_CONFLICT_CHOICE:-1}
+
+        case "$PORT_CONFLICT_CHOICE" in
+            1)
+                deploy_mode="custom_port"
+                read -p "请输入对外映射的主机端口 [默认: 18080]: " CUSTOM_PORT_INPUT
+                custom_port=${CUSTOM_PORT_INPUT:-18080}
+                while ! check_port "$custom_port"; do
+                    error "端口 ${custom_port} 仍被占用，请更换其他端口！"
+                    read -p "请输入对外映射的主机端口 [默认: 18080]: " CUSTOM_PORT_INPUT
+                    custom_port=${CUSTOM_PORT_INPUT:-18080}
+                done
+                success "已选择独立端口模式，将映射到公网端口: ${custom_port}"
+                ;;
+            2)
+                deploy_mode="caddy_ssl"
+                warn "请自行在外部停止占用 80/443 的进程后再继续。"
+                ;;
+            *)
+                info "已取消部署。"
+                exit 0
+                ;;
+        esac
+    else
+        success "80 / 443 端口空闲，可使用 Caddy 自动申请 HTTPS 模式。"
+    fi
+
+    # 2. 交互收集域名或 IP
     echo ""
-    echo -e "${YELLOW}提示: 请确保域名已在 DNS 处添加 A 记录解析到本 VPS IP (若用 Cloudflare 请设置为 DNS Only / 灰色小云朵)。${NC}"
-    while true; do
-        read -p "请输入您绑定的完整域名 (例如: api.example.com): " DOMAIN_INPUT
-        if [[ "$DOMAIN_INPUT" =~ ^[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]$ ]]; then
-            break
-        else
-            error "域名格式不合法，请重新输入！"
-        fi
-    done
+    if [ "$deploy_mode" = "caddy_ssl" ]; then
+        echo -e "${YELLOW}提示: 请确保域名已在 DNS 处添加 A 记录解析到本 VPS IP (若用 Cloudflare 请设置为 DNS Only / 灰色小云朵)。${NC}"
+        while true; do
+            read -p "请输入您绑定的完整域名 (例如: api.example.com): " DOMAIN_INPUT
+            if [[ "$DOMAIN_INPUT" =~ ^[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]$ ]]; then
+                domain_input="$DOMAIN_INPUT"
+                break
+            else
+                error "域名格式不合法，请重新输入！"
+            fi
+        done
+        read -p "请输入 SSL 证书接收告警邮箱 [默认: admin@${domain_input}]: " EMAIL_INPUT
+        EMAIL_INPUT=${EMAIL_INPUT:-"admin@${domain_input}"}
+    else
+        LOCAL_IP=$(curl -4sSL https://api.ipify.org || curl -4sSL https://icanhazip.com || echo "YOUR_VPS_IP")
+        echo -e "${CYAN}当前处于独立端口模式，可直接通过 http://${LOCAL_IP}:${custom_port} 访问，也可通过现有 Nginx 反代。${NC}"
+        read -p "请输入访问域名或主机IP [默认: ${LOCAL_IP}]: " DOMAIN_INPUT
+        domain_input=${DOMAIN_INPUT:-$LOCAL_IP}
+        EMAIL_INPUT="admin@sub2api.local"
+    fi
 
-    # 3. 收集 ACME 邮箱
-    read -p "请输入 SSL 证书接收告警邮箱 [默认: admin@${DOMAIN_INPUT}]: " EMAIL_INPUT
-    EMAIL_INPUT=${EMAIL_INPUT:-"admin@${DOMAIN_INPUT}"}
+    # 3. 收集管理员邮箱
+    read -p "请输入 Sub2API 初始管理员账号邮箱 [默认: admin@${domain_input}]: " ADMIN_EMAIL_INPUT
+    ADMIN_EMAIL_INPUT=${ADMIN_EMAIL_INPUT:-"admin@${domain_input}"}
 
-    # 4. 收集管理员邮箱
-    read -p "请输入 Sub2API 初始管理员账号邮箱 [默认: admin@${DOMAIN_INPUT}]: " ADMIN_EMAIL_INPUT
-    ADMIN_EMAIL_INPUT=${ADMIN_EMAIL_INPUT:-"admin@${DOMAIN_INPUT}"}
-
-    # 5. 收集/生成管理员密码
+    # 4. 收集/生成管理员密码
     DEFAULT_PASS=$(gen_password 16)
     read -p "请输入 Sub2API 管理员密码 [回车使用随机安全密码: ${DEFAULT_PASS}]: " ADMIN_PASS_INPUT
     ADMIN_PASS_INPUT=${ADMIN_PASS_INPUT:-$DEFAULT_PASS}
 
-    # 6. 选择是否启用 Gemini 适配层
+    # 5. 选择是否启用 Gemini 适配层
     echo ""
     echo -e "是否启用 ${GREEN}Gemini 工具调用与 Thinking 标签双向适配层${NC}？"
     echo -e "  - 自动修复 Gemini 400 Unknown name 'const' / 'anyOf' 错误"
@@ -714,11 +793,11 @@ deploy_wizard() {
             ;;
     esac
 
-    # 7. 确认部署
+    # 6. 确认部署
     echo ""
     title "部署参数确认"
-    echo -e "绑定域名       : ${GREEN}${DOMAIN_INPUT}${NC}"
-    echo -e "证书通知邮箱   : ${CYAN}${EMAIL_INPUT}${NC}"
+    echo -e "部署模式       : $([ "$deploy_mode" = "caddy_ssl" ] && echo -e "${GREEN}Caddy 自动 HTTPS (80/443)${NC}" || echo -e "${YELLOW}独立端口模式 (${custom_port})${NC}")"
+    echo -e "绑定地址/域名  : ${GREEN}${domain_input}${NC}"
     echo -e "管理员账号     : ${CYAN}${ADMIN_EMAIL_INPUT}${NC}"
     echo -e "管理员密码     : ${YELLOW}${ADMIN_PASS_INPUT}${NC}"
     echo -e "Gemini 适配层  : $([ "$ENABLE_ADAPTER" = "true" ] && echo -e "${GREEN}已启用 (全场景 Thinking 适配版)${NC}" || echo -e "${RED}已关闭${NC}")"
@@ -732,7 +811,12 @@ deploy_wizard() {
 
     # 执行安装流程
     install_dependencies
-    configure_firewall
+    if [ "$deploy_mode" = "caddy_ssl" ]; then
+        configure_firewall 80
+        configure_firewall 443
+    else
+        configure_firewall "$custom_port"
+    fi
     install_docker
 
     info "正在创建安装目录并写入配置文件..."
@@ -746,7 +830,9 @@ deploy_wizard() {
 
     # 安全写入 .env 文件
     cat > "$ENV_FILE" << EOF
-DOMAIN="${DOMAIN_INPUT}"
+DOMAIN="${domain_input}"
+DEPLOY_MODE="${deploy_mode}"
+HOST_PORT="${custom_port}"
 ACME_EMAIL="${EMAIL_INPUT}"
 ADMIN_EMAIL="${ADMIN_EMAIL_INPUT}"
 ADMIN_PASSWORD="${ADMIN_PASS_INPUT}"
@@ -759,7 +845,7 @@ EOF
     chmod 600 "$ENV_FILE"
 
     # 生成 Compose 与 Caddyfile
-    generate_compose "$DOMAIN_INPUT" "$ENABLE_ADAPTER"
+    generate_compose "$domain_input" "$ENABLE_ADAPTER" "$deploy_mode" "$custom_port"
 
     info "正在拉取 Docker 镜像并启动容器集群..."
     run_compose pull
@@ -777,11 +863,17 @@ EOF
     while [ $retry -lt $max_retries ]; do
         sleep 3
         local sub2api_status=$(docker inspect --format '{{.State.Status}}' sub2api 2>/dev/null || echo "not_found")
-        local caddy_status=$(docker inspect --format '{{.State.Status}}' sub2api-caddy 2>/dev/null || echo "not_found")
-        
-        if [ "$sub2api_status" = "running" ] && [ "$caddy_status" = "running" ]; then
-            is_ready=1
-            break
+        if [ "$deploy_mode" = "caddy_ssl" ]; then
+            local caddy_status=$(docker inspect --format '{{.State.Status}}' sub2api-caddy 2>/dev/null || echo "not_found")
+            if [ "$sub2api_status" = "running" ] && [ "$caddy_status" = "running" ]; then
+                is_ready=1
+                break
+            fi
+        else
+            if [ "$sub2api_status" = "running" ]; then
+                is_ready=1
+                break
+            fi
         fi
         retry=$((retry + 1))
         echo -n "."
@@ -791,7 +883,20 @@ EOF
     if [ $is_ready -eq 1 ]; then
         echo ""
         title "Sub2API 部署成功！"
-        echo -e "公网访问地址   : ${GREEN}https://${DOMAIN_INPUT}${NC}"
+        if [ "$deploy_mode" = "caddy_ssl" ]; then
+            echo -e "公网访问地址   : ${GREEN}https://${domain_input}${NC}"
+        else
+            echo -e "公网访问地址   : ${GREEN}http://${domain_input}:${custom_port}${NC}"
+            echo -e "----------------------------------------------------------------------"
+            echo -e "若需使用当前 VPS 已有的 Nginx 反代并配置 HTTPS，可在 Nginx 中添加："
+            echo -e "${CYAN}location / {${NC}"
+            echo -e "${CYAN}    proxy_pass http://127.0.0.1:${custom_port};${NC}"
+            echo -e "${CYAN}    proxy_set_header Host \$host;${NC}"
+            echo -e "${CYAN}    proxy_set_header X-Real-IP \$remote_addr;${NC}"
+            echo -e "${CYAN}    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;${NC}"
+            echo -e "${CYAN}    proxy_set_header X-Forwarded-Proto \$scheme;${NC}"
+            echo -e "${CYAN}}${NC}"
+        fi
         echo -e "管理员账号     : ${CYAN}${ADMIN_EMAIL_INPUT}${NC}"
         echo -e "管理员密码     : ${YELLOW}${ADMIN_PASS_INPUT}${NC}"
         echo -e "----------------------------------------------------------------------"
