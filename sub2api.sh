@@ -849,10 +849,19 @@ deploy_wizard() {
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    # 生成安全的随机密码与 Hex 密钥 (TOTP 必须为 64 位 Hex 字符)
-    PG_PASS=$(gen_password 24)
-    JWT_SEC=$(gen_hex_key 32)
-    TOTP_KEY=$(gen_hex_key 32)
+    # 生成/复用安全的随机密码与 Hex 密钥 (避免重复部署时与已有 postgres_data 密码失配)
+    local existing_pg_pass=$(read_env "POSTGRES_PASSWORD")
+    local existing_jwt_sec=$(read_env "JWT_SECRET")
+    local existing_totp_key=$(read_env "TOTP_ENCRYPTION_KEY")
+
+    PG_PASS=${existing_pg_pass:-$(gen_password 24)}
+    JWT_SEC=${existing_jwt_sec:-$(gen_hex_key 32)}
+    TOTP_KEY=${existing_totp_key:-$(gen_hex_key 32)}
+
+    # 校验 TOTP Key 是否为有效 64 位 Hex (如遇旧版本生成的无效 Key 则自动纠正并提示)
+    if [[ ! "$TOTP_KEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        TOTP_KEY=$(gen_hex_key 32)
+    fi
 
     # 安全写入 .env 文件
     cat > "$ENV_FILE" << EOF
