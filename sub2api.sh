@@ -8,9 +8,10 @@
 #   2. 内置 Gemini 工具调用 Schema 适配层 (解决 const/anyOf 400 报错)
 #   3. 内置 Thinking 标签提取与 reasoning_content 结构化转换
 #   4. 多线程并发代理与流式 SSE 低延迟传输
-#   5. 容器健康检查与独立内网隔离，保护数据库安全
-#   6. 注册全局 `sub2api` 命令，随时随地一键管理
-#   7. 完整的运维面板 (启停/日志/改密/换域名/备份/更新/卸载)
+#   5. 智能防火墙放行 (自动放行 ufw / firewalld 80/443 端口)
+#   6. 容器健康检查与独立内网隔离，保护数据库安全
+#   7. 注册全局 `sub2api` 命令，随时随地一键管理
+#   8. 完整的运维面板 (启停/日志/改密/换域名/备份/更新/卸载)
 # ==============================================================================
 
 set -e
@@ -33,6 +34,7 @@ CADDY_FILE="${INSTALL_DIR}/caddy/Caddyfile"
 ADAPTER_DIR="${INSTALL_DIR}/adapter"
 BACKUP_DIR="${INSTALL_DIR}/backups"
 GLOBAL_BIN="/usr/local/bin/sub2api"
+SCRIPT_URL="https://raw.githubusercontent.com/yys9253462-gif/sub2api-vps/main/sub2api.sh"
 
 # --- 辅助输出函数 ---
 info() { echo -e "${CYAN}[INFO]${NC} $*"; }
@@ -114,6 +116,31 @@ install_dependencies() {
             warn "无法自动安装基础包，请确保 curl, openssl, tar 已安装。"
             ;;
     esac
+}
+
+# --- 智能放行防火墙 ---
+configure_firewall() {
+    info "正在检测并配置系统防火墙，确保 80 / 443 端口通畅..."
+    # UFW (Ubuntu / Debian)
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        ufw allow 80/tcp >/dev/null 2>&1 || true
+        ufw allow 443/tcp >/dev/null 2>&1 || true
+        success "已通过 UFW 放行 80 / 443 端口。"
+    fi
+
+    # Firewalld (CentOS / RHEL / Alma / Rocky / Fedora)
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port=443/tcp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        success "已通过 Firewalld 放行 80 / 443 端口。"
+    fi
+
+    # iptables 通用兜底放行
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
+    fi
 }
 
 # --- Docker 与 Docker Compose 检测及自动安装 ---
@@ -377,6 +404,7 @@ EOF
 FROM python:3.11-alpine
 WORKDIR /app
 COPY adapter_service.py .
+USER nobody
 EXPOSE 8086
 CMD ["python", "-u", "adapter_service.py", "8086"]
 EOF
@@ -562,11 +590,18 @@ networks:
 EOF
 }
 
-# --- 注册全局快捷管理命令 ---
+# --- 注册全局快捷管理命令 (修复 curl|bash 下 $0 不是实体脚本的严重 Bug) ---
 register_global_cmd() {
-    cp "$0" "${INSTALL_DIR}/sub2api.sh" 2>/dev/null || true
+    info "正在配置全局快捷管理命令 'sub2api'..."
+    mkdir -p "$INSTALL_DIR"
+    if [ -f "$0" ] && grep -q "Sub2API VPS" "$0" 2>/dev/null; then
+        cp "$0" "${INSTALL_DIR}/sub2api.sh"
+    else
+        curl -fsSL "$SCRIPT_URL" -o "${INSTALL_DIR}/sub2api.sh" || true
+    fi
     chmod +x "${INSTALL_DIR}/sub2api.sh" 2>/dev/null || true
     ln -sf "${INSTALL_DIR}/sub2api.sh" "$GLOBAL_BIN" 2>/dev/null || true
+    success "全局快捷命令已注册！在终端任何路径直接输入 'sub2api' 即可唤出管理面板。"
 }
 
 # --- 一键全新部署交互向导 ---
@@ -640,6 +675,7 @@ deploy_wizard() {
 
     # 开始执行安装流程
     install_dependencies
+    configure_firewall
     install_docker
 
     info "正在创建安装目录并写入配置文件..."
@@ -782,9 +818,13 @@ update_services() {
 change_domain() {
     title "更换绑定域名与重签 HTTPS 证书"
     cd "$INSTALL_DIR"
+    if [ ! -f "$ENV_FILE" ]; then
+        error "未找到配置文件！"
+        return
+    fi
     . "$ENV_FILE"
     echo -e "当前配置的域名为: ${YELLOW}${DOMAIN}${NC}"
-    read -p "请输入全新的域名: " NEW_DOMAIN
+    read -p "请输入全新的域名 (例如: api.newdomain.com): " NEW_DOMAIN
     if [ -z "$NEW_DOMAIN" ]; then
         error "域名不能为空！"
         return
@@ -796,14 +836,18 @@ change_domain() {
     # 重新生成配置
     generate_compose "$NEW_DOMAIN" "${ENABLE_ADAPTER:-true}"
 
-    info "正在重启 Caddy 以申请新域名的 SSL 证书..."
-    run_compose up -d --force-recreate caddy
-    success "域名已更新为: https://${NEW_DOMAIN}，Caddy 正在后台申请 HTTPS 证书。"
+    info "正在重新加载容器并让 Caddy 申请新域名证书..."
+    run_compose up -d --remove-orphans
+    success "域名已成功更新为: https://${NEW_DOMAIN}，Caddy 正在后台自动申请 HTTPS 证书。"
 }
 
 reset_admin_password() {
     title "重置 Sub2API 管理员密码"
     cd "$INSTALL_DIR"
+    if [ ! -f "$ENV_FILE" ]; then
+        error "未找到配置文件！"
+        return
+    fi
     . "$ENV_FILE"
     DEFAULT_P=$(gen_password 16)
     read -p "请输入新密码 [回车使用随机密码: ${DEFAULT_P}]: " NEW_P
@@ -824,23 +868,32 @@ backup_data() {
     mkdir -p "$BACKUP_DIR"
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     TAR_FILE="${BACKUP_DIR}/sub2api_backup_${TIMESTAMP}.tar.gz"
+    SQL_DUMP="${INSTALL_DIR}/sub2api_dump_${TIMESTAMP}.sql"
 
-    info "正在导出 PostgreSQL 数据库..."
-    cd "$INSTALL_DIR"
-    docker exec sub2api-db pg_dump -U sub2api sub2api > "${INSTALL_DIR}/sub2api_dump_${TIMESTAMP}.sql"
+    info "正在检查数据库容器状态并导出数据..."
+    if ! docker exec sub2api-db pg_dump -U sub2api sub2api > "$SQL_DUMP" 2>/dev/null || [ ! -s "$SQL_DUMP" ]; then
+        warn "PostgreSQL 实时导出失败或为空，将直接打包磁盘持久卷数据。"
+        rm -f "$SQL_DUMP"
+    fi
 
-    info "正在打包关键数据目录与配置..."
+    info "正在打包核心数据目录与配置..."
     tar -czf "$TAR_FILE" \
         -C "$INSTALL_DIR" \
         .env \
         docker-compose.yml \
         caddy \
         data \
-        "sub2api_dump_${TIMESTAMP}.sql" 2>/dev/null
+        postgres_data \
+        redis_data \
+        $( [ -f "$SQL_DUMP" ] && echo "sub2api_dump_${TIMESTAMP}.sql" ) 2>/dev/null || true
 
-    rm -f "${INSTALL_DIR}/sub2api_dump_${TIMESTAMP}.sql"
-    success "备份文件已生成: ${GREEN}${TAR_FILE}${NC}"
-    echo -e "文件大小: $(du -h "$TAR_FILE" | awk '{print $1}')"
+    rm -f "$SQL_DUMP"
+    if [ -f "$TAR_FILE" ] && [ -s "$TAR_FILE" ]; then
+        success "备份文件已生成: ${GREEN}${TAR_FILE}${NC}"
+        echo -e "文件大小: $(du -h "$TAR_FILE" | awk '{print $1}')"
+    else
+        error "备份生成失败，请检查磁盘剩余空间！"
+    fi
 }
 
 uninstall_all() {
@@ -854,7 +907,7 @@ uninstall_all() {
 
     if [ -d "$INSTALL_DIR" ]; then
         cd "$INSTALL_DIR"
-        info "正在停止并清理容器..."
+        info "正在停止并清理容器与网络..."
         run_compose down -v --remove-orphans 2>/dev/null || true
         info "正在删除安装目录: ${INSTALL_DIR}..."
         rm -rf "$INSTALL_DIR"
@@ -875,7 +928,7 @@ main_menu() {
         echo -e "${PURPLE}======================================================================${NC}"
         if [ -f "$ENV_FILE" ]; then
             . "$ENV_FILE"
-            echo -e " 运行状态 : $(docker ps | grep -q 'sub2api' && echo -e "${GREEN}● 运行中${NC}" || echo -e "${RED}○ 已停止${NC}")"
+            echo -e " 运行状态 : $(docker ps 2>/dev/null | grep -q 'sub2api' && echo -e "${GREEN}● 运行中${NC}" || echo -e "${RED}○ 已停止${NC}")"
             echo -e " 绑定域名 : ${CYAN}https://${DOMAIN}${NC}"
             echo -e " 管理账号 : ${CYAN}${ADMIN_EMAIL}${NC}"
             echo -e " 适配层   : $([ "$ENABLE_ADAPTER" = "true" ] && echo -e "${GREEN}已开启 (Gemini 400/Thinking 优化)${NC}" || echo -e "${YELLOW}未启用${NC}")"
