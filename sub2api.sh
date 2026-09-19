@@ -217,6 +217,24 @@ gen_hex_key() {
     openssl rand -hex "$bytes"
 }
 
+# --- 获取系统高位随机空闲端口 (20000-55000) ---
+get_random_free_port() {
+    local min=20000
+    local max=55000
+    local port
+    while true; do
+        if command -v shuf >/dev/null 2>&1; then
+            port=$(shuf -i ${min}-${max} -n 1)
+        else
+            port=$(awk -v min=$min -v max=$max 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+        fi
+        if check_port "$port"; then
+            echo "$port"
+            return 0
+        fi
+    done
+}
+
 # --- 生成 Gemini 适配层源码 (含非流式与流式全场景 Thinking 提取与编码保护) ---
 generate_adapter() {
     mkdir -p "$ADAPTER_DIR"
@@ -728,48 +746,42 @@ deploy_wizard() {
         run_compose down --remove-orphans 2>/dev/null || true
     fi
 
-    # 1. 检查端口占用与部署模式选择
-    local deploy_mode="caddy_ssl"
-    local custom_port=18080
+    # 1. 端口与部署模式选择 (默认随机高位端口，不占用 80/443)
+    local deploy_mode="custom_port"
+    local custom_port
     local domain_input=""
 
-    info "正在检查 80 / 443 端口占用状态..."
-    local port80_busy=0
-    local port443_busy=0
-    if ! check_port 80; then port80_busy=1; fi
-    if ! check_port 443; then port443_busy=1; fi
+    # 自动生成一个当前空闲的高位随机端口
+    local default_rand_port=$(get_random_free_port)
 
-    if [ $port80_busy -eq 1 ] || [ $port443_busy -eq 1 ]; then
-        warn "检测到端口 80 或 443 已被系统现有服务 (如 Nginx/Apache/Xray) 占用！"
-        echo -e "  [1] ${GREEN}使用独立端口共存模式 (推荐，不影响现有 Nginx 站点)${NC}"
-        echo -e "  [2] 终止现有服务并由 Caddy 独占 80/443"
-        echo -e "  [0] 退出部署"
-        read -p "请选择应对方案 [1-2, 默认: 1]: " PORT_CONFLICT_CHOICE
-        PORT_CONFLICT_CHOICE=${PORT_CONFLICT_CHOICE:-1}
+    echo ""
+    echo -e "${GREEN}【部署模式选择】为了防止与 VPS 现有网站或 Xray 节点冲突，默认采用随机独立端口运行。${NC}"
+    echo -e "  [1] ${BOLD}${GREEN}随机高位端口模式 (推荐，不占用 80/443，可自由接入反代)${NC}"
+    echo -e "  [2] 纯净独占模式 (由内置 Caddy 独占 80/443 自动申请 SSL 证书)"
+    read -p "请选择部署模式 [1-2, 默认: 1]: " MODE_CHOICE
+    MODE_CHOICE=${MODE_CHOICE:-1}
 
-        case "$PORT_CONFLICT_CHOICE" in
-            1)
-                deploy_mode="custom_port"
-                read -p "请输入对外映射的主机端口 [默认: 18080]: " CUSTOM_PORT_INPUT
-                custom_port=${CUSTOM_PORT_INPUT:-18080}
-                while ! check_port "$custom_port"; do
-                    error "端口 ${custom_port} 仍被占用，请更换其他端口！"
-                    read -p "请输入对外映射的主机端口 [默认: 18080]: " CUSTOM_PORT_INPUT
-                    custom_port=${CUSTOM_PORT_INPUT:-18080}
-                done
-                success "已选择独立端口模式，将映射到公网端口: ${custom_port}"
-                ;;
-            2)
-                deploy_mode="caddy_ssl"
-                warn "请自行在外部停止占用 80/443 的进程后再继续。"
-                ;;
-            *)
-                info "已取消部署。"
-                exit 0
-                ;;
-        esac
-    else
+    if [ "$MODE_CHOICE" = "2" ]; then
+        deploy_mode="caddy_ssl"
+        info "正在检查 80 / 443 端口占用状态..."
+        if ! check_port 80 || ! check_port 443; then
+            error "端口 80 或 443 已被系统现有服务占用！无法使用纯净独占模式，请停止占用程序或改用随机端口模式。"
+            exit 1
+        fi
         success "80 / 443 端口空闲，可使用 Caddy 自动申请 HTTPS 模式。"
+    else
+        deploy_mode="custom_port"
+        echo ""
+        echo -e "${CYAN}已为您生成当前系统未占用的随机端口: ${BOLD}${GREEN}${default_rand_port}${NC}"
+        read -p "请输入对外映射端口 [直接回车使用随机端口 ${default_rand_port}]: " USER_PORT_INPUT
+        custom_port=${USER_PORT_INPUT:-$default_rand_port}
+        while ! check_port "$custom_port"; do
+            error "端口 ${custom_port} 已被占用，请更换其他端口！"
+            local new_rand=$(get_random_free_port)
+            read -p "请输入对外映射端口 [推荐空闲端口: ${new_rand}]: " USER_PORT_INPUT
+            custom_port=${USER_PORT_INPUT:-$new_rand}
+        done
+        success "已确认使用端口: ${custom_port} (80/443 端口保持不受影响)"
     fi
 
     # 2. 交互收集域名或 IP
