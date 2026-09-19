@@ -756,8 +756,8 @@ deploy_wizard() {
 
     echo ""
     echo -e "${GREEN}【部署模式选择】为了防止与 VPS 现有网站或 Xray 节点冲突，默认采用随机独立端口运行。${NC}"
-    echo -e "  [1] ${BOLD}${GREEN}随机高位端口模式 (推荐，不占用 80/443，可自由接入反代)${NC}"
-    echo -e "  [2] 纯净独占模式 (由内置 Caddy 独占 80/443 自动申请 SSL 证书)"
+    echo -e "  [1] ${BOLD}${GREEN}随机高位端口模式 (推荐！无域名亦可用，直接公网 IP 访问，不占用 80/443)${NC}"
+    echo -e "  [2] 域名独占模式 (需已解析域名，由 Caddy 独占 80/443 自动申请 SSL 证书)"
     read -p "请选择部署模式 [1-2, 默认: 1]: " MODE_CHOICE
     MODE_CHOICE=${MODE_CHOICE:-1}
 
@@ -801,8 +801,8 @@ deploy_wizard() {
         EMAIL_INPUT=${EMAIL_INPUT:-"admin@${domain_input}"}
     else
         LOCAL_IP=$(curl -4sSL https://api.ipify.org || curl -4sSL https://icanhazip.com || echo "YOUR_VPS_IP")
-        echo -e "${CYAN}当前处于独立端口模式，可直接通过 http://${LOCAL_IP}:${custom_port} 访问，也可通过现有 Nginx 反代。${NC}"
-        read -p "请输入访问域名或主机IP [默认: ${LOCAL_IP}]: " DOMAIN_INPUT
+        echo -e "${CYAN}提示: 若没有域名，可直接回车使用当前公网 IP 直连访问！${NC}"
+        read -p "请输入访问域名或主机IP [无域名直接回车，默认: ${LOCAL_IP}]: " DOMAIN_INPUT
         domain_input=${DOMAIN_INPUT:-$LOCAL_IP}
         EMAIL_INPUT="admin@sub2api.local"
     fi
