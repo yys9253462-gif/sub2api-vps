@@ -474,13 +474,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
         except HTTPError as e:
             self.send_response(e.code)
+            for k, v in e.headers.items():
+                if k.lower() not in ("transfer-encoding", "content-length", "connection", "content-encoding"):
+                    self.send_header(k, v)
+            err_body = e.read()
+            self.send_header("Content-Length", str(len(err_body)))
             self.end_headers()
-            self.wfile.write(e.read())
+            self.wfile.write(err_body)
         except Exception as e:
             logging.error(f"Proxy error: {e}")
             self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            err_msg = json.dumps({"error": str(e)}).encode('utf-8')
+            self.send_header("Content-Length", str(len(err_msg)))
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+            self.wfile.write(err_msg)
 
 def run_server(port=8086):
     server = ThreadedHTTPServer(("0.0.0.0", port), ProxyHandler)
@@ -1067,27 +1075,52 @@ change_domain() {
 }
 
 reset_admin_password() {
-    title "Sub2API 管理员密码管理"
+    title "Sub2API 管理员密码重置"
     cd "$INSTALL_DIR"
     if [ ! -f "$ENV_FILE" ]; then
         error "未找到配置文件！"
         return
     fi
     local cur_email=$(read_env "ADMIN_EMAIL")
-    echo -e "当前管理员账号: ${CYAN}${cur_email}${NC}"
+    echo -e "当前配置管理员账号: ${CYAN}${cur_email}${NC}"
     echo ""
-    echo -e "${YELLOW}注意: Sub2API 的密码由数据库安全加密存储。${NC}"
-    echo -e "  方法 1 (推荐): 请直接登录 Web 管理后台 -> 右上角个人中心直接修改密码。"
-    echo -e "  方法 2: 若彻底忘记密码且无法登录，可通过本工具重置 .env 初始化密码并按需重建。"
-    echo ""
-    read -p "是否更新 .env 中的预设管理员密码？[y/N]: " UPDATE_ENV_PASS
-    if [[ "$UPDATE_ENV_PASS" =~ ^[yY] ]]; then
-        DEFAULT_P=$(gen_password 16)
-        read -p "请输入新密码 [回车使用随机密码: ${DEFAULT_P}]: " NEW_P
-        NEW_P=${NEW_P:-$DEFAULT_P}
+    echo -e "请选择重置方式:"
+    echo -e "  [1] ${BOLD}${GREEN}直接更新 PostgreSQL 数据库密码 (推荐，即刻生效且无需清空数据)${NC}"
+    echo -e "  [2] 更新 .env 中的预设管理员密码"
+    read -p "请选择操作 [1-2, 默认: 1]: " RESET_CHOICE
+    RESET_CHOICE=${RESET_CHOICE:-1}
+
+    DEFAULT_P=$(gen_password 16)
+    read -p "请输入新密码 [回车使用随机密码: ${DEFAULT_P}]: " NEW_P
+    NEW_P=${NEW_P:-$DEFAULT_P}
+
+    if [ "$RESET_CHOICE" = "1" ]; then
+        info "正在检测 PostgreSQL 数据库容器状态并重置密码..."
+        if ! docker ps | grep -q "sub2api-db"; then
+            error "PostgreSQL 数据库容器 (sub2api-db) 未运行，请先启动服务！"
+            return
+        fi
+
+        # 获取数据库中的管理员实际邮箱
+        local db_email=$(docker exec -i sub2api-db psql -U sub2api -d sub2api -t -A -c "SELECT email FROM users WHERE role = 'admin' OR role = 'superadmin' ORDER BY id ASC LIMIT 1;" 2>/dev/null)
+        local target_email="${db_email:-$cur_email}"
+
+        # 通过 pgcrypto 使用 bcrypt 更新 password_hash
+        local sql="CREATE EXTENSION IF NOT EXISTS pgcrypto; UPDATE users SET password_hash = crypt('${NEW_P}', gen_salt('bf', 10)) WHERE email = '${target_email}';"
+        if docker exec -i sub2api-db psql -U sub2api -d sub2api -c "$sql" >/dev/null 2>&1; then
+            # 同时同步更新 .env
+            sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=\"${NEW_P}\"/g" "$ENV_FILE"
+            success "管理员密码已成功重置！"
+            echo -e "登录账号: ${CYAN}${target_email}${NC}"
+            echo -e "全新密码: ${YELLOW}${NEW_P}${NC}"
+            info "您现在可以直接在浏览器 Web 页面使用新密码登录，无需重启容器。"
+        else
+            error "数据库直接重置失败，请检查数据库状态。"
+        fi
+    else
         sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=\"${NEW_P}\"/g" "$ENV_FILE"
         success "已更新 .env 中的预设管理员密码为: ${YELLOW}${NEW_P}${NC}"
-        info "请在 Web 后台使用该密码登录；如遇老库不生效，请进入后台个人资料中同步修改。"
+        info "提示: Sub2API 仅在首次初始化数据库时读取 .env 中的密码；若数据库已初始化，建议使用选项 [1] 直接更新数据库。"
     fi
 }
 
